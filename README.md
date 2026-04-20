@@ -1,5 +1,21 @@
 # claude-peers
 
+**This is a fork of [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp)** focused on performance and bug fixes. I don't plan on adding Windows support, support for other LLMs, etc. I've applied fixes from the following PRs:
+
+- [#1](https://github.com/louislva/claude-peers-mcp/pull/1)
+- [#7](https://github.com/louislva/claude-peers-mcp/pull/7) by [@Bortlesboat](https://github.com/Bortlesboat)
+- [#10](https://github.com/louislva/claude-peers-mcp/pull/10) by [@pivanov](https://github.com/pivanov)
+- [#13](https://github.com/louislva/claude-peers-mcp/pull/13) by [@Twice971](https://github.com/Twice971)
+- [#17](https://github.com/louislva/claude-peers-mcp/pull/17) by [@pmatos](https://github.com/pmatos)
+- [#21](https://github.com/louislva/claude-peers-mcp/pull/21) by [@mototsugu-ando-dev](https://github.com/mototsugu-ando-dev)
+- [#24](https://github.com/louislva/claude-peers-mcp/pull/24) by [@technote-space](https://github.com/technote-space)
+- [#25](https://github.com/louislva/claude-peers-mcp/pull/25) by [@mikez93](https://github.com/mikez93)
+- [#34](https://github.com/louislva/claude-peers-mcp/pull/34) by [@sekkr1](https://github.com/sekkr1)
+- [#40](https://github.com/louislva/claude-peers-mcp/pull/40) by [@kyle-cassidy](https://github.com/kyle-cassidy)
+- [#41](https://github.com/louislva/claude-peers-mcp/pull/41) by [@hmdak](https://github.com/hmdak)
+
+Original README as follows:
+
 Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
 
 ```

@@ -19,12 +19,13 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME ?? process.env.USERPROFILE}/.claude-peers.db`;
 
 // --- Database setup ---
 
@@ -59,15 +60,38 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    if (e?.code === "EPERM") return true;
+    if (process.platform === "win32") {
+      try {
+        const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const output = new TextDecoder().decode(result.stdout);
+        return output.includes(String(pid));
+      } catch {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+const STALE_TIMEOUT_MS = 60_000;
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const now = Date.now();
+  const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    const lastSeen = new Date(peer.last_seen).getTime();
+    const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
+
+    if (!isProcessAlive(peer.pid) || isHeartbeatStale) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -121,6 +145,10 @@ const selectUndelivered = db.prepare(`
 
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
+`);
+
+const markDeliveredScoped = db.prepare(`
+  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
 `);
 
 // --- Generate peer ID ---
@@ -185,16 +213,16 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  const now = Date.now();
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
+    const lastSeen = new Date(p.last_seen).getTime();
+    const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
+
+    if (!isProcessAlive(p.pid) || isHeartbeatStale) {
       deletePeer.run(p.id);
       return false;
     }
+    return true;
   });
 }
 
@@ -211,13 +239,20 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
+  // Read-only: caller must explicitly ack via /ack-messages
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
+  const acked = db.transaction(() => {
+    let count = 0;
+    for (const id of body.ids) {
+      const result = markDeliveredScoped.run(id, body.peer_id);
+      count += result.changes;
+    }
+    return count;
+  })();
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -258,6 +293,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
