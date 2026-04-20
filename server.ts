@@ -36,6 +36,7 @@ import {
   formatClientCapabilities,
   supportsClaudeChannel,
 } from "./shared/channel.ts";
+import { homedir } from "node:os";
 
 // --- Configuration ---
 
@@ -44,7 +45,7 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = Bun.fileURLToPath(new URL("./broker.ts", import.meta.url));
-const BROKER_LOG = `${Bun.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG = `${homedir()}/.claude-peers-broker.log`;
 
 // --- Broker communication ---
 
@@ -107,7 +108,7 @@ function log(msg: string) {
 
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
-    const result = await Bun.$`git -C ${cwd} rev-parse --path-format=absolute --git-common-dir`.quiet().nothrow();
+    const result = await Bun.$`git -C ${cwd} rev-parse --show-toplevel`.quiet().nothrow();
     if (result.exitCode === 0) {
       return result.text().trim();
     }
@@ -251,10 +252,6 @@ const TOOLS = [
         to: {
           type: "string" as const,
           description: "The peer ID of the target Claude Code instance (from list_peers)",
-        },
-        to_id: {
-          type: "string" as const,
-          description: "Alias for 'to' (deprecated, use 'to' instead)",
         },
         message: {
           type: "string" as const,

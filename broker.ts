@@ -23,9 +23,10 @@ import type {
   Peer,
   Message,
 } from "./shared/types.ts";
+import { homedir } from "node:os";
 
 const PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = Bun.env.CLAUDE_PEERS_DB ?? `${Bun.env.HOME ?? Bun.env.USERPROFILE}/.claude-peers.db`;
+const DB_PATH = Bun.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
 
 // --- Database setup ---
 
@@ -95,7 +96,7 @@ function cleanStalePeers() {
   for (const peer of peers) {
     const lastSeen = new Date(peer.last_seen).getTime();
     const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
-    if (!isProcessAlive(peer.pid) || isHeartbeatStale) {
+    if (!isProcessAlive(peer.pid) && isHeartbeatStale) {
       staleIds.push(peer.id);
     }
   }
