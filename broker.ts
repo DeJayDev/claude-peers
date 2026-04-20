@@ -24,8 +24,8 @@ import type {
   Message,
 } from "./shared/types.ts";
 
-const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME ?? process.env.USERPROFILE}/.claude-peers.db`;
+const PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const DB_PATH = Bun.env.CLAUDE_PEERS_DB ?? `${Bun.env.HOME ?? Bun.env.USERPROFILE}/.claude-peers.db`;
 
 // --- Database setup ---
 
@@ -33,6 +33,9 @@ const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
 db.run("PRAGMA synchronous = NORMAL");
 db.run("PRAGMA busy_timeout = 3000");
+db.run("PRAGMA temp_store = MEMORY");
+db.run("PRAGMA mmap_size = 134217728");
+db.run("PRAGMA foreign_keys = ON");
 
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
@@ -60,6 +63,11 @@ db.run(`
   )
 `);
 
+db.run("CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(to_id, delivered)");
+db.run("CREATE INDEX IF NOT EXISTS idx_peers_pid ON peers(pid)");
+db.run("CREATE INDEX IF NOT EXISTS idx_peers_cwd ON peers(cwd)");
+db.run("CREATE INDEX IF NOT EXISTS idx_peers_git_root ON peers(git_root)");
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -68,11 +76,7 @@ function isProcessAlive(pid: number): boolean {
     if (e?.code === "EPERM") return true;
     if (process.platform === "win32") {
       try {
-        const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-        const output = new TextDecoder().decode(result.stdout);
+        const output = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"]).stdout.toString();
         return output.includes(String(pid));
       } catch {
         return true;
@@ -87,15 +91,18 @@ const STALE_TIMEOUT_MS = 60_000;
 function cleanStalePeers() {
   const now = Date.now();
   const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
+  const staleIds: string[] = [];
   for (const peer of peers) {
     const lastSeen = new Date(peer.last_seen).getTime();
     const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
-
     if (!isProcessAlive(peer.pid) || isHeartbeatStale) {
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      staleIds.push(peer.id);
     }
   }
+  if (staleIds.length === 0) return;
+  const placeholders = staleIds.map(() => "?").join(",");
+  db.run(`DELETE FROM messages WHERE delivered = 0 AND to_id IN (${placeholders})`, staleIds);
+  db.run(`DELETE FROM peers WHERE id IN (${placeholders})`, staleIds);
 }
 
 cleanStalePeers();
@@ -143,21 +150,31 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+const selectPeerById = db.prepare(`
+  SELECT id FROM peers WHERE id = ?
 `);
 
 const markDeliveredScoped = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
 `);
 
+const selectPeerByPid = db.prepare(`
+  SELECT id FROM peers WHERE pid = ?
+`);
+
+const countPeers = db.prepare(`
+  SELECT COUNT(*) as n FROM peers
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
   let id = "";
   for (let i = 0; i < 8; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
+    id += chars[bytes[i]! % chars.length];
   }
   return id;
 }
@@ -169,7 +186,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
 
   // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  const existing = selectPeerByPid.get(body.pid) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
@@ -227,8 +244,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  const target = selectPeerById.get(body.to_id) as { id: string } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
@@ -243,16 +259,17 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+const ackMessagesTxn = db.transaction((ids: number[], peerId: string) => {
+  let count = 0;
+  for (const id of ids) {
+    count += markDeliveredScoped.run(id, peerId).changes;
+  }
+  return count;
+});
+
 function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
-  const acked = db.transaction(() => {
-    let count = 0;
-    for (const id of body.ids) {
-      const result = markDeliveredScoped.run(id, body.peer_id);
-      count += result.changes;
-    }
-    return count;
-  })();
-  return { ok: true, acked };
+  if (body.ids.length === 0) return { ok: true, acked: 0 };
+  return { ok: true, acked: ackMessagesTxn(body.ids, body.peer_id) };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -261,50 +278,50 @@ function handleUnregister(body: { id: string }): void {
 
 // --- HTTP Server ---
 
+async function jsonHandler(req: Request, handler: (body: any) => any): Promise<Response> {
+  try {
+    const body = await req.json();
+    return Response.json(handler(body));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return Response.json({ error: msg }, { status: 500 });
+  }
+}
+
 Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
-  async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
-
-    if (req.method !== "POST") {
-      if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
-      }
-      return new Response("claude-peers broker", { status: 200 });
-    }
-
-    try {
-      const body = await req.json();
-
-      switch (path) {
-        case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
-        case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
-        case "/set-summary":
-          handleSetSummary(body as SetSummaryRequest);
-          return Response.json({ ok: true });
-        case "/list-peers":
-          return Response.json(handleListPeers(body as ListPeersRequest));
-        case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
-        case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
-        case "/ack-messages":
-          return Response.json(handleAckMessages(body as AckMessagesRequest));
-        case "/unregister":
-          handleUnregister(body as { id: string });
-          return Response.json({ ok: true });
-        default:
-          return Response.json({ error: "not found" }, { status: 404 });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return Response.json({ error: msg }, { status: 500 });
-    }
+  routes: {
+    "/health": {
+      GET: () => Response.json({ status: "ok", peers: (countPeers.get() as { n: number }).n }),
+    },
+    "/register": {
+      POST: (req) => jsonHandler(req, (body) => handleRegister(body)),
+    },
+    "/heartbeat": {
+      POST: (req) => jsonHandler(req, (body) => { handleHeartbeat(body); return { ok: true }; }),
+    },
+    "/set-summary": {
+      POST: (req) => jsonHandler(req, (body) => { handleSetSummary(body); return { ok: true }; }),
+    },
+    "/list-peers": {
+      POST: (req) => jsonHandler(req, (body) => handleListPeers(body)),
+    },
+    "/send-message": {
+      POST: (req) => jsonHandler(req, (body) => handleSendMessage(body)),
+    },
+    "/poll-messages": {
+      POST: (req) => jsonHandler(req, (body) => handlePollMessages(body)),
+    },
+    "/ack-messages": {
+      POST: (req) => jsonHandler(req, (body) => handleAckMessages(body)),
+    },
+    "/unregister": {
+      POST: (req) => jsonHandler(req, (body) => { handleUnregister(body); return { ok: true }; }),
+    },
+  },
+  fetch() {
+    return new Response("claude-peers broker", { status: 200 });
   },
 });
 

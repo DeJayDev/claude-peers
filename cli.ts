@@ -11,7 +11,7 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
@@ -32,7 +32,7 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-const cmd = process.argv[2];
+const cmd = Bun.argv[2];
 
 switch (cmd) {
   case "status": {
@@ -106,8 +106,8 @@ switch (cmd) {
   }
 
   case "send": {
-    const toId = process.argv[3];
-    const msg = process.argv.slice(4).join(" ");
+    const toId = Bun.argv[3];
+    const msg = Bun.argv.slice(4).join(" ");
     if (!toId || !msg) {
       console.error("Usage: bun cli.ts send <peer-id> <message>");
       process.exit(1);
@@ -134,12 +134,8 @@ switch (cmd) {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
       // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
+      const result = await Bun.$`lsof -ti :${BROKER_PORT}`.quiet().nothrow();
+      const pids = result.text().trim().split("\n").filter((p) => p);
       for (const pid of pids) {
         process.kill(parseInt(pid), "SIGTERM");
       }

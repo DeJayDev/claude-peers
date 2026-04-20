@@ -39,12 +39,12 @@ import {
 
 // --- Configuration ---
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = Bun.fileURLToPath(new URL("./broker.ts", import.meta.url));
-const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG = `${Bun.env.HOME}/.claude-peers-broker.log`;
 
 // --- Broker communication ---
 
@@ -53,6 +53,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -88,7 +89,7 @@ async function ensureBroker(): Promise<void> {
 
   // Wait for it to come up
   for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
+    await Bun.sleep(200);
     if (await isBrokerAlive()) {
       log("Broker started");
       return;
@@ -106,19 +107,11 @@ function log(msg: string) {
 
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
+    const result = await Bun.$`git -C ${cwd} rev-parse --path-format=absolute --git-common-dir`.quiet().nothrow();
+    if (result.exitCode === 0) {
+      return result.text().trim();
     }
-  } catch {
-    // not a git repo
-  }
+  } catch {}
   return null;
 }
 
@@ -127,8 +120,7 @@ function getTty(): string | null {
   try {
     const ppid = process.ppid;
     if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
+      const tty = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]).stdout.toString().trim();
       if (tty && tty !== "?" && tty !== "??") {
         return tty;
       }
@@ -667,7 +659,7 @@ async function main() {
   })();
 
   // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  await Promise.race([summaryPromise, Bun.sleep(3000)]);
 
   // 5. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
