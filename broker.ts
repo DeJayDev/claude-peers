@@ -51,6 +51,14 @@ db.run(`
   )
 `);
 
+// Migrate pre-CASCADE messages table by dropping it; undelivered messages are ephemeral.
+const existingMessagesSchema = db.query(
+  "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
+).get() as { sql: string } | null;
+if (existingMessagesSchema && !existingMessagesSchema.sql.includes("ON DELETE CASCADE")) {
+  db.run("DROP TABLE messages");
+}
+
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,8 +67,8 @@ db.run(`
     text TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (from_id) REFERENCES peers(id),
-    FOREIGN KEY (to_id) REFERENCES peers(id)
+    FOREIGN KEY (from_id) REFERENCES peers(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_id) REFERENCES peers(id) ON DELETE CASCADE
   )
 `);
 
@@ -236,7 +244,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     const lastSeen = new Date(p.last_seen).getTime();
     const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
 
-    if (!isProcessAlive(p.pid) || isHeartbeatStale) {
+    if (!isProcessAlive(p.pid) && isHeartbeatStale) {
       deletePeer.run(p.id);
       return false;
     }
