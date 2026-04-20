@@ -364,8 +364,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to, to_id: toIdLegacy, message } = args as { to?: string; to_id?: string; message: string };
-      const to_id = to ?? toIdLegacy;
+      const { to, message } = args as { to: string; message: string };
       if (!myId) {
         const ok = await ensureRegistered();
         if (!ok || !myId) {
@@ -378,7 +377,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
           from_id: myId,
-          to_id,
+          to,
           text: message,
         });
         if (!result.ok) {
@@ -389,7 +388,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const pending = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to}${pending ?? ""}` }],
         };
       } catch (e) {
         return {

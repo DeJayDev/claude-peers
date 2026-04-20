@@ -115,7 +115,7 @@ switch (cmd) {
     try {
       const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
         from_id: "cli",
-        to_id: toId,
+        to: toId,
         text: msg,
       });
       if (result.ok) {

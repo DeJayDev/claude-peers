@@ -77,6 +77,14 @@ db.run("CREATE INDEX IF NOT EXISTS idx_peers_pid ON peers(pid)");
 db.run("CREATE INDEX IF NOT EXISTS idx_peers_cwd ON peers(cwd)");
 db.run("CREATE INDEX IF NOT EXISTS idx_peers_git_root ON peers(git_root)");
 
+// Sentinel peer so CLI-sent messages satisfy the from_id FK.
+const now = new Date().toISOString();
+db.run(
+  `INSERT OR IGNORE INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
+   VALUES ('cli', 0, '/', NULL, NULL, 'CLI sender', ?, ?)`,
+  [now, now],
+);
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -156,7 +164,8 @@ const insertMessage = db.prepare(`
 `);
 
 const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+  SELECT id, from_id, to_id AS "to", text, sent_at, delivered
+  FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
 const selectPeerById = db.prepare(`
@@ -253,12 +262,12 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  const target = selectPeerById.get(body.to_id) as { id: string } | null;
+  const target = selectPeerById.get(body.to) as { id: string } | null;
   if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+    return { ok: false, error: `Peer ${body.to} not found` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  insertMessage.run(body.from_id, body.to, body.text, new Date().toISOString());
   return { ok: true };
 }
 
