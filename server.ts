@@ -31,6 +31,7 @@ import {
   generateSummary,
   getGitBranch,
   getRecentFiles,
+  SUMMARY_MODEL,
 } from "./shared/summarize.ts";
 import {
   formatClientCapabilities,
@@ -633,7 +634,7 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 4. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
+  // 4. Generate initial summary via SUMMARY_MODEL (non-blocking, best-effort)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {

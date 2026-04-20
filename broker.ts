@@ -248,6 +248,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
+  // Hide the 'cli' sentinel row — it's only there to satisfy the from_id FK
+  // for CLI-sent messages, not a real peer anyone can message.
+  peers = peers.filter((p) => p.id !== "cli");
+
   const now = Date.now();
   return peers.filter((p) => {
     const lastSeen = new Date(p.last_seen).getTime();

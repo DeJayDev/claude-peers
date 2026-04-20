@@ -1,11 +1,4 @@
-/**
- * Generate a 1-2 sentence summary of what a Claude Code instance is likely
- * working on, based on its working directory and git context.
- *
- * Uses OpenAI's gpt-5.4-nano for cheap, fast inference.
- * Requires OPENAI_API_KEY environment variable.
- * Falls back gracefully if unavailable.
- */
+export const SUMMARY_MODEL = "gpt-5.4-nano";
 
 export async function generateSummary(context: {
   cwd: string;
@@ -37,7 +30,7 @@ export async function generateSummary(context: {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-5.4-nano",
+        model: SUMMARY_MODEL,
         messages: [
           {
             role: "system",
