@@ -15,7 +15,7 @@ export interface Peer {
 export interface Message {
   id: number;
   from_id: PeerId;
-  to_id: PeerId;
+  to: PeerId;
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;
@@ -54,7 +54,7 @@ export interface ListPeersRequest {
 
 export interface SendMessageRequest {
   from_id: PeerId;
-  to_id: PeerId;
+  to: PeerId;
   text: string;
 }
 

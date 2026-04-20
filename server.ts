@@ -31,20 +31,22 @@ import {
   generateSummary,
   getGitBranch,
   getRecentFiles,
+  SUMMARY_MODEL,
 } from "./shared/summarize.ts";
 import {
   formatClientCapabilities,
   supportsClaudeChannel,
 } from "./shared/channel.ts";
+import { homedir } from "node:os";
 
 // --- Configuration ---
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = Bun.fileURLToPath(new URL("./broker.ts", import.meta.url));
-const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG = `${homedir()}/.claude-peers-broker.log`;
 
 // --- Broker communication ---
 
@@ -53,6 +55,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -88,7 +91,7 @@ async function ensureBroker(): Promise<void> {
 
   // Wait for it to come up
   for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
+    await Bun.sleep(200);
     if (await isBrokerAlive()) {
       log("Broker started");
       return;
@@ -106,19 +109,11 @@ function log(msg: string) {
 
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
+    const result = await Bun.$`git -C ${cwd} rev-parse --show-toplevel`.quiet().nothrow();
+    if (result.exitCode === 0) {
+      return result.text().trim();
     }
-  } catch {
-    // not a git repo
-  }
+  } catch {}
   return null;
 }
 
@@ -127,8 +122,7 @@ function getTty(): string | null {
   try {
     const ppid = process.ppid;
     if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
+      const tty = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]).stdout.toString().trim();
       if (tty && tty !== "?" && tty !== "??") {
         return tty;
       }
@@ -260,10 +254,6 @@ const TOOLS = [
           type: "string" as const,
           description: "The peer ID of the target Claude Code instance (from list_peers)",
         },
-        to_id: {
-          type: "string" as const,
-          description: "Alias for 'to' (deprecated, use 'to' instead)",
-        },
         message: {
           type: "string" as const,
           description: "The message to send",
@@ -375,8 +365,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to, to_id: toIdLegacy, message } = args as { to?: string; to_id?: string; message: string };
-      const to_id = to ?? toIdLegacy;
+      const { to, message } = args as { to: string; message: string };
       if (!myId) {
         const ok = await ensureRegistered();
         if (!ok || !myId) {
@@ -389,7 +378,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
           from_id: myId,
-          to_id,
+          to,
           text: message,
         });
         if (!result.ok) {
@@ -400,7 +389,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const pending = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -645,7 +634,7 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 4. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
+  // 4. Generate initial summary via SUMMARY_MODEL (non-blocking, best-effort)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {
@@ -667,7 +656,7 @@ async function main() {
   })();
 
   // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  await Promise.race([summaryPromise, Bun.sleep(3000)]);
 
   // 5. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {

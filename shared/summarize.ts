@@ -1,11 +1,4 @@
-/**
- * Generate a 1-2 sentence summary of what a Claude Code instance is likely
- * working on, based on its working directory and git context.
- *
- * Uses OpenAI's gpt-5.4-nano for cheap, fast inference.
- * Requires OPENAI_API_KEY environment variable.
- * Falls back gracefully if unavailable.
- */
+export const SUMMARY_MODEL = "gpt-5.4-nano";
 
 export async function generateSummary(context: {
   cwd: string;
@@ -13,7 +6,7 @@ export async function generateSummary(context: {
   git_branch?: string | null;
   recent_files?: string[];
 }): Promise<string | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = Bun.env.OPENAI_API_KEY;
   if (!apiKey) {
     return null;
   }
@@ -37,7 +30,7 @@ export async function generateSummary(context: {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-5.4-nano",
+        model: SUMMARY_MODEL,
         messages: [
           {
             role: "system",
@@ -73,19 +66,11 @@ export async function generateSummary(context: {
  */
 export async function getGitBranch(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
+    const result = await Bun.$`git -C ${cwd} rev-parse --abbrev-ref HEAD`.quiet().nothrow();
+    if (result.exitCode === 0) {
+      return result.text().trim();
     }
-  } catch {
-    // not a git repo
-  }
+  } catch {}
   return null;
 }
 
@@ -97,40 +82,15 @@ export async function getRecentFiles(
   limit = 10
 ): Promise<string[]> {
   try {
-    // Get modified/staged files first
-    const diffProc = Bun.spawn(["git", "diff", "--name-only", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const diffText = await new Response(diffProc.stdout).text();
-    await diffProc.exited;
-
-    const files = diffText
-      .trim()
-      .split("\n")
-      .filter((f) => f.length > 0);
+    const diffResult = await Bun.$`git -C ${cwd} diff --name-only HEAD`.quiet().nothrow();
+    const files = diffResult.text().trim().split("\n").filter((f) => f.length > 0);
 
     if (files.length >= limit) {
       return files.slice(0, limit);
     }
 
-    // Also get recently committed files
-    const logProc = Bun.spawn(
-      ["git", "log", "--oneline", "--name-only", "-5", "--format="],
-      {
-        cwd,
-        stdout: "pipe",
-        stderr: "ignore",
-      }
-    );
-    const logText = await new Response(logProc.stdout).text();
-    await logProc.exited;
-
-    const logFiles = logText
-      .trim()
-      .split("\n")
-      .filter((f) => f.length > 0);
+    const logResult = await Bun.$`git -C ${cwd} log --oneline --name-only -5 --format=`.quiet().nothrow();
+    const logFiles = logResult.text().trim().split("\n").filter((f) => f.length > 0);
 
     const allFiles = [...new Set([...files, ...logFiles])];
     return allFiles.slice(0, limit);
