@@ -30,6 +30,7 @@ const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peer
 
 const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
+db.run("PRAGMA synchronous = NORMAL");
 db.run("PRAGMA busy_timeout = 3000");
 
 db.run(`
