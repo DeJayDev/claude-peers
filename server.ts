@@ -33,10 +33,6 @@ import {
   getRecentFiles,
   SUMMARY_MODEL,
 } from "./shared/summarize.ts";
-import {
-  formatClientCapabilities,
-  supportsClaudeChannel,
-} from "./shared/channel.ts";
 import { homedir } from "node:os";
 
 // --- Configuration ---
@@ -707,20 +703,11 @@ function startInboundMessagePolling() {
     return;
   }
 
-  const clientCapabilities = mcp.getClientCapabilities();
   const clientVersion = mcp.getClientVersion();
   const clientName = clientVersion?.name ?? "unknown";
   const clientVersionText = clientVersion?.version ? ` ${clientVersion.version}` : "";
 
   log(`Client connected: ${clientName}${clientVersionText}`);
-  log(`Client capabilities: ${formatClientCapabilities(clientCapabilities)}`);
-
-  if (!supportsClaudeChannel(clientCapabilities)) {
-    log(
-      "Client does not advertise experimental claude/channel; skipping background polling so peer_check remains reliable."
-    );
-    return;
-  }
 
   pollActive = true;
   inboundPollingStarted = true;
@@ -732,7 +719,7 @@ function startInboundMessagePolling() {
   }
 
   setTimeout(schedulePoll, POLL_INTERVAL_MS);
-  log("Client supports claude/channel; background polling enabled.");
+  log("Background polling enabled.");
 }
 
 // --- Startup ---
