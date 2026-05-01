@@ -1,4 +1,4 @@
-export const SUMMARY_MODEL = "gpt-5.4-nano";
+export const SUMMARY_MODEL = Bun.env.OPENAI_MODEL ?? "gpt-5.4-nano";
 
 export async function generateSummary(context: {
   cwd: string;
@@ -10,6 +10,7 @@ export async function generateSummary(context: {
   if (!apiKey) {
     return null;
   }
+  const baseUrl = (Bun.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "");
 
   const parts = [`Working directory: ${context.cwd}`];
   if (context.git_root) {
@@ -23,7 +24,7 @@ export async function generateSummary(context: {
   }
 
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -35,7 +36,7 @@ export async function generateSummary(context: {
           {
             role: "system",
             content:
-              "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task.",
+              "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task. Plain text only — no markdown, no bold, no asterisks. The recently-modified file list may include deleted files; don't assume every file still exists.",
           },
           {
             role: "user",

@@ -128,6 +128,8 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
 | `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `OPENAI_BASE_URL`    | `https://api.openai.com/v1` | Override for OpenAI-compatible endpoints |
+| `OPENAI_MODEL`       | `gpt-5.4-nano`       | Model used for auto-summary           |
 
 ## Requirements
 
