@@ -25,7 +25,7 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
   Message,
-  AckMessagesRequest,
+  SendMessageResponse,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -133,6 +133,19 @@ function getTty(): string | null {
   return null;
 }
 
+function relTime(iso: string | null): string {
+  if (!iso) return "never";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return "just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -177,6 +190,11 @@ const localBufferIds = new Set<number>();
 
 const confirmedDeliveredIds = new Set<number>();
 
+function formatMessageLine(m: Message): string {
+  const thread = m.in_reply_to ? ` (reply to #${m.in_reply_to})` : "";
+  return `From ${m.from_id} at ${m.sent_at}${thread}:\n${m.text}`;
+}
+
 async function drainPendingMessages(): Promise<string | null> {
   if (!myId) return null;
   const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
@@ -193,33 +211,72 @@ async function drainPendingMessages(): Promise<string | null> {
 
   for (const id of ids) confirmedDeliveredIds.add(id);
 
-  const lines = unseen.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`);
+  const lines = unseen.map(formatMessageLine);
   return `\n\n---\n${unseen.length} pending peer message(s):\n\n${lines.join("\n\n---\n\n")}`;
+}
+
+// Resolve a `to` argument into concrete peer IDs. Accepts:
+//   - string peer ID (e.g. "asci1836")
+//   - array of peer IDs
+//   - scope selector string: "all" | "repo" | "directory"
+async function resolveRecipients(to: unknown): Promise<{ ids: PeerId[]; error?: string }> {
+  if (Array.isArray(to)) {
+    const ids = to.filter((x): x is string => typeof x === "string");
+    if (ids.length === 0) return { ids: [], error: "Empty recipient list" };
+    return { ids };
+  }
+  if (typeof to !== "string" || to.length === 0) {
+    return { ids: [], error: "Recipient must be a peer ID, array of IDs, or scope selector" };
+  }
+
+  const scopeSelectors: Record<string, "machine" | "repo" | "directory"> = {
+    all: "machine",
+    machine: "machine",
+    repo: "repo",
+    directory: "directory",
+  };
+  const scope = scopeSelectors[to];
+  if (scope) {
+    try {
+      const peers = await brokerFetch<Peer[]>("/list-peers", {
+        scope,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        exclude_id: myId,
+      });
+      return { ids: peers.map((p) => p.id) };
+    } catch (e) {
+      return { ids: [], error: `Failed to resolve scope "${to}": ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  // Treat as literal peer ID.
+  return { ids: [to] };
 }
 
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `claude-peers connects you to other Claude Code instances (and other MCP clients) on this machine. You can discover peers, send them messages, and receive messages pushed via the claude/channel capability.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using the MCP tool mcp__claude-peers__send_message (NOT the built-in SendMessage tool), then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+When an inbound peer message arrives, treat it like a coworker tapping you on the shoulder: pause current work, read it, reply, then resume. Don't batch replies to the end of your task — by then the sender has moved on.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling mcp__claude-peers__send_message with their from_id.
+Inbound messages carry from_id, from_summary, from_cwd, sent_at, message_id, and (if threaded) in_reply_to. Reply with peer_send, passing in_reply_to=<message_id> when continuing a thread.
 
-WARNING: Do NOT use the built-in "SendMessage" tool to reply. You MUST use the MCP tools listed below (prefixed with mcp__claude-peers__ in Claude Code):
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
-- set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
-- whoami: Get your own peer ID, CWD, and git root
+Tools:
+- peer_list: discover peers (scope: machine/directory/repo), with each peer's summary, channel liveness, and last-active time.
+- peer_send: send a message to a peer ID, an array of IDs, or a scope selector ("all", "repo", "directory") for broadcast.
+- peer_summary: set a 1-2 sentence summary of your current work (shown to other peers in peer_list).
+- peer_check: manually pull pending messages (fallback for clients without channel push).
+- peer_whoami: your own peer ID, CWD, and git root.
 
-When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
+On startup, call peer_summary with a 1-2 sentence description of your current work.`,
   }
 );
 
@@ -227,9 +284,9 @@ When you start, proactively call set_summary to describe what you're working on.
 
 const TOOLS = [
   {
-    name: "list_peers",
+    name: "peer_list",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List other Claude Code instances running on this machine. Each entry includes ID, working directory, git repo, summary (with age), and a liveness hint.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -244,28 +301,36 @@ const TOOLS = [
     },
   },
   {
-    name: "send_message",
+    name: "peer_send",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      'Send a message to one or more Claude Code instances. "to" is a peer ID, an array of peer IDs, or a scope selector ("all", "repo", "directory") to broadcast. Returns a per-recipient delivery hint: "responsive" (seen something recently), "active" (mid-task), "idle" (quiet for a while), or "no_channel" (peer must run peer_check to see it). Pass in_reply_to with a message_id to thread multi-turn exchanges.',
     inputSchema: {
       type: "object" as const,
       properties: {
         to: {
-          type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          oneOf: [
+            { type: "string" as const },
+            { type: "array" as const, items: { type: "string" as const } },
+          ],
+          description:
+            'Recipient(s): a peer ID from peer_list, an array of peer IDs, or a scope selector string ("all", "repo", "directory").',
         },
         message: {
           type: "string" as const,
           description: "The message to send",
+        },
+        in_reply_to: {
+          type: "number" as const,
+          description: "Optional: message_id of the message you're replying to, for threading.",
         },
       },
       required: ["to", "message"],
     },
   },
   {
-    name: "set_summary",
+    name: "peer_summary",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
+      "Set a brief summary (1-2 sentences) of what you are currently working on. Visible to other Claude Code instances via peer_list.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -278,16 +343,16 @@ const TOOLS = [
     },
   },
   {
-    name: "check_messages",
+    name: "peer_check",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Manually check for new messages from other Claude Code instances. Messages normally arrive via channel push, but this is a reliable fallback.",
     inputSchema: {
       type: "object" as const,
       properties: {},
     },
   },
   {
-    name: "whoami",
+    name: "peer_whoami",
     description:
       "Returns this Claude Code instance's own peer ID, working directory, and git root. Useful for telling other peers how to message you.",
     inputSchema: {
@@ -303,11 +368,35 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
+function formatPeerEntry(p: Peer): string {
+  const parts = [
+    `ID: ${p.id}`,
+    `PID: ${p.pid}`,
+    `CWD: ${p.cwd}`,
+  ];
+  if (p.git_root) parts.push(`Repo: ${p.git_root}`);
+  if (p.tty) parts.push(`TTY: ${p.tty}`);
+  if (p.summary) {
+    const age = p.summary_updated_at ? ` (set ${relTime(p.summary_updated_at)})` : "";
+    parts.push(`Summary: ${p.summary}${age}`);
+  } else {
+    parts.push(`Summary: (none)`);
+  }
+
+  // Liveness: last model activity, plus whether channel push is working.
+  const channelOn = p.last_poll_at && Date.now() - new Date(p.last_poll_at).getTime() < 5_000;
+  parts.push(
+    `Activity: last tool call ${relTime(p.last_active_at)}; channel ${channelOn ? "active" : "inactive (peer_check required)"}`,
+  );
+
+  return parts.join("\n  ");
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
   switch (name) {
-    case "list_peers": {
+    case "peer_list": {
       const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
@@ -330,18 +419,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
-        });
+        const lines = peers.map(formatPeerEntry);
 
         return {
           content: [
@@ -364,8 +442,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "send_message": {
-      const { to, message } = args as { to: string; message: string };
+    case "peer_send": {
+      const { to, message, in_reply_to } = args as {
+        to: unknown;
+        message: string;
+        in_reply_to?: number;
+      };
       if (!myId) {
         const ok = await ensureRegistered();
         if (!ok || !myId) {
@@ -375,21 +457,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
       }
-      try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-          from_id: myId,
-          to,
-          text: message,
-        });
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
-            isError: true,
-          };
-        }
-        const pending = await drainPendingMessages();
+
+      const { ids, error: resolveError } = await resolveRecipients(to);
+      if (resolveError) {
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Failed to resolve recipients: ${resolveError}` }],
+          isError: true,
+        };
+      }
+      if (ids.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No matching peers for the given selector." }],
+        };
+      }
+
+      try {
+        const result = await brokerFetch<SendMessageResponse>("/send-message", {
+          from_id: myId,
+          to: ids,
+          text: message,
+          in_reply_to,
+        });
+        const pending = await drainPendingMessages();
+
+        const failed = result.deliveries.filter((d) => !d.ok);
+        let text: string;
+        if (ids.length === 1) {
+          const d = result.deliveries[0]!;
+          text = d.ok ? `Sent.` : `Failed: ${d.error ?? "unknown"}`;
+        } else {
+          const okCount = result.deliveries.length - failed.length;
+          const failLines = failed.map((d) => `  ${d.peer_id}: ${d.error ?? "unknown"}`);
+          text =
+            failed.length === 0
+              ? `Sent to ${okCount} peer(s).`
+              : `Sent to ${okCount}/${ids.length} peer(s). Failed:\n${failLines.join("\n")}`;
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `${text}${pending ?? ""}` }],
+          isError: !result.ok,
         };
       } catch (e) {
         return {
@@ -404,7 +511,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "set_summary": {
+    case "peer_summary": {
       const { summary } = args as { summary: string };
       if (!myId) {
         const ok = await ensureRegistered();
@@ -434,7 +541,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "check_messages": {
+    case "peer_check": {
       if (!myId) {
         const ok = await ensureRegistered();
         if (!ok || !myId) {
@@ -478,9 +585,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         for (const id of ids) confirmedDeliveredIds.add(id);
 
-        const lines = allMessages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+        const lines = allMessages.map(formatMessageLine);
         return {
           content: [
             {
@@ -502,7 +607,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "whoami": {
+    case "peer_whoami": {
       return {
         content: [
           {
@@ -552,26 +657,45 @@ async function pollAndPushMessages() {
       // Non-critical — channel push proceeds without sender context
     }
 
+    const pushedIds: number[] = [];
     for (const msg of newMessages) {
       try {
         const sender = peerCache?.find((p) => p.id === msg.from_id);
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: `${msg.text}\n\n[Reply using the mcp__claude-peers__send_message tool, NOT the built-in SendMessage tool.]`,
+            content: msg.text,
             meta: {
               from_id: msg.from_id,
               from_summary: sender?.summary ?? "",
               from_cwd: sender?.cwd ?? "",
               sent_at: msg.sent_at,
               message_id: String(msg.id),
+              in_reply_to: msg.in_reply_to != null ? String(msg.in_reply_to) : "",
             },
           },
         });
-        log(`Channel push attempted for message ${msg.id} from ${msg.from_id}`);
+        log(`Channel push succeeded for message ${msg.id} from ${msg.from_id}`);
+        pushedIds.push(msg.id);
       } catch (e) {
         log(`Channel push failed for ${msg.from_id}: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+
+    // Successful channel pushes are considered delivered — drop from the local
+    // buffer and ack to the broker so the next tool call doesn't re-surface them.
+    // Failed pushes stay buffered; drainPendingMessages will show them on the
+    // next tool call as a fallback.
+    if (pushedIds.length > 0 && myId) {
+      const pushed = new Set(pushedIds);
+      for (const id of pushedIds) {
+        confirmedDeliveredIds.add(id);
+        localBufferIds.delete(id);
+      }
+      for (let i = localMessageBuffer.length - 1; i >= 0; i--) {
+        if (pushed.has(localMessageBuffer[i]!.id)) localMessageBuffer.splice(i, 1);
+      }
+      brokerFetch("/ack-messages", { peer_id: myId, ids: pushedIds }).catch(() => {});
     }
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -593,7 +717,7 @@ function startInboundMessagePolling() {
 
   if (!supportsClaudeChannel(clientCapabilities)) {
     log(
-      "Client does not advertise experimental claude/channel; skipping background polling so check_messages remains reliable."
+      "Client does not advertise experimental claude/channel; skipping background polling so peer_check remains reliable."
     );
     return;
   }
@@ -684,7 +808,7 @@ async function main() {
   }
 
   // 6. Start polling for inbound messages only when the client supports channel push
-  //    Non-channel clients rely on check_messages so their messages stay queued.
+  //    Non-channel clients rely on peer_check so their messages stay queued.
 
   // 7. Start heartbeat (with auto-re-register on stale eviction)
   const heartbeatTimer = setInterval(async () => {

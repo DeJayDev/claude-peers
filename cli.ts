@@ -14,6 +14,31 @@
 const BROKER_PORT = parseInt(Bun.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
+type PeerRow = {
+  id: string;
+  pid: number;
+  cwd: string;
+  git_root: string | null;
+  tty: string | null;
+  summary: string;
+  summary_updated_at: string | null;
+  last_seen: string;
+  last_active_at: string | null;
+  last_poll_at: string | null;
+};
+
+function relTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return "just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
     ? {
@@ -42,17 +67,7 @@ switch (cmd) {
       console.log(`URL: ${BROKER_URL}`);
 
       if (health.peers > 0) {
-        const peers = await brokerFetch<
-          Array<{
-            id: string;
-            pid: number;
-            cwd: string;
-            git_root: string | null;
-            tty: string | null;
-            summary: string;
-            last_seen: string;
-          }>
-        >("/list-peers", {
+        const peers = await brokerFetch<PeerRow[]>("/list-peers", {
           scope: "machine",
           cwd: "/",
           git_root: null,
@@ -61,9 +76,14 @@ switch (cmd) {
         console.log("\nPeers:");
         for (const p of peers) {
           console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
-          if (p.summary) console.log(`         ${p.summary}`);
+          if (p.summary) {
+            const age = p.summary_updated_at ? ` (${relTime(p.summary_updated_at)})` : "";
+            console.log(`         Summary: ${p.summary}${age}`);
+          }
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);
+          console.log(`         Last active: ${p.last_active_at ?? "never"}`);
+          console.log(`         Last poll:   ${p.last_poll_at ?? "never"}`);
         }
       }
     } catch {
@@ -74,17 +94,7 @@ switch (cmd) {
 
   case "peers": {
     try {
-      const peers = await brokerFetch<
-        Array<{
-          id: string;
-          pid: number;
-          cwd: string;
-          git_root: string | null;
-          tty: string | null;
-          summary: string;
-          last_seen: string;
-        }>
-      >("/list-peers", {
+      const peers = await brokerFetch<PeerRow[]>("/list-peers", {
         scope: "machine",
         cwd: "/",
         git_root: null,
@@ -95,7 +105,11 @@ switch (cmd) {
       } else {
         for (const p of peers) {
           const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
-          if (p.summary) parts.push(`  Summary: ${p.summary}`);
+          if (p.summary) {
+            const age = p.summary_updated_at ? ` (${relTime(p.summary_updated_at)})` : "";
+            parts.push(`  Summary: ${p.summary}${age}`);
+          }
+          parts.push(`  Active: ${p.last_active_at ? relTime(p.last_active_at) : "never"}`);
           console.log(parts.join("\n"));
         }
       }
@@ -113,15 +127,24 @@ switch (cmd) {
       process.exit(1);
     }
     try {
-      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      const result = await brokerFetch<{
+        ok: boolean;
+        error?: string;
+        deliveries: Array<{ peer_id: string; ok: boolean; error?: string; hint?: string; message_id?: number }>;
+      }>("/send-message", {
         from_id: "cli",
         to: toId,
         text: msg,
       });
-      if (result.ok) {
-        console.log(`Message sent to ${toId}`);
-      } else {
-        console.error(`Failed: ${result.error}`);
+      if (!result.ok) {
+        console.error(`Failed: ${result.error ?? "no successful deliveries"}`);
+      }
+      for (const d of result.deliveries) {
+        if (d.ok) {
+          console.log(`  ${d.peer_id}: sent (message_id=${d.message_id}, ${d.hint ?? "unknown"})`);
+        } else {
+          console.log(`  ${d.peer_id}: failed (${d.error ?? "unknown"})`);
+        }
       }
     } catch (e) {
       console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);

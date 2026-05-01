@@ -17,11 +17,15 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
+  SendMessageResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   AckMessagesRequest,
   Peer,
   Message,
+  Delivery,
+  DeliveryHint,
+  PeerId,
 } from "./shared/types.ts";
 import { homedir } from "node:os";
 
@@ -46,10 +50,25 @@ db.run(`
     git_root TEXT,
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    summary_updated_at TEXT,
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    last_active_at TEXT,
+    last_poll_at TEXT
   )
 `);
+
+// Additive migrations for pre-existing dbs — ignore "duplicate column" errors.
+function addColumnIfMissing(table: string, column: string, definition: string) {
+  try {
+    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (e) {
+    if (!(e instanceof Error) || !/duplicate column/i.test(e.message)) throw e;
+  }
+}
+addColumnIfMissing("peers", "summary_updated_at", "TEXT");
+addColumnIfMissing("peers", "last_active_at", "TEXT");
+addColumnIfMissing("peers", "last_poll_at", "TEXT");
 
 // Migrate pre-CASCADE messages table by dropping it; undelivered messages are ephemeral.
 const existingMessagesSchema = db.query(
@@ -67,10 +86,14 @@ db.run(`
     text TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0,
+    acked_at TEXT,
+    in_reply_to INTEGER,
     FOREIGN KEY (from_id) REFERENCES peers(id) ON DELETE CASCADE,
     FOREIGN KEY (to_id) REFERENCES peers(id) ON DELETE CASCADE
   )
 `);
+addColumnIfMissing("messages", "acked_at", "TEXT");
+addColumnIfMissing("messages", "in_reply_to", "INTEGER");
 
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(to_id, delivered)");
 db.run("CREATE INDEX IF NOT EXISTS idx_peers_pid ON peers(pid)");
@@ -78,11 +101,11 @@ db.run("CREATE INDEX IF NOT EXISTS idx_peers_cwd ON peers(cwd)");
 db.run("CREATE INDEX IF NOT EXISTS idx_peers_git_root ON peers(git_root)");
 
 // Sentinel peer so CLI-sent messages satisfy the from_id FK.
-const now = new Date().toISOString();
+const bootNow = new Date().toISOString();
 db.run(
   `INSERT OR IGNORE INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
    VALUES ('cli', 0, '/', NULL, NULL, 'CLI sender', ?, ?)`,
-  [now, now],
+  [bootNow, bootNow],
 );
 
 function isProcessAlive(pid: number): boolean {
@@ -130,16 +153,24 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, summary_updated_at, registered_at, last_seen, last_active_at, last_poll_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
 `);
 
 const updateLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE id = ?
 `);
 
+const updateLastActive = db.prepare(`
+  UPDATE peers SET last_active_at = ?, last_seen = ? WHERE id = ?
+`);
+
+const updateLastPoll = db.prepare(`
+  UPDATE peers SET last_poll_at = ?, last_seen = ? WHERE id = ?
+`);
+
 const updateSummary = db.prepare(`
-  UPDATE peers SET summary = ? WHERE id = ?
+  UPDATE peers SET summary = ?, summary_updated_at = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -159,21 +190,21 @@ const selectPeersByGitRoot = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, in_reply_to)
+  VALUES (?, ?, ?, ?, 0, ?)
 `);
 
 const selectUndelivered = db.prepare(`
-  SELECT id, from_id, to_id AS "to", text, sent_at, delivered
+  SELECT id, from_id, to_id AS "to", text, sent_at, delivered, acked_at, in_reply_to
   FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
 const selectPeerById = db.prepare(`
-  SELECT id FROM peers WHERE id = ?
+  SELECT id, last_active_at, last_poll_at, last_seen FROM peers WHERE id = ?
 `);
 
 const markDeliveredScoped = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
+  UPDATE messages SET delivered = 1, acked_at = ? WHERE id = ? AND to_id = ?
 `);
 
 const selectPeerByPid = db.prepare(`
@@ -197,6 +228,31 @@ function generateId(): string {
   return id;
 }
 
+// --- Activity / delivery hint helpers ---
+
+// Any peer-originated, model-initiated call (send, set_summary, ack, list with exclude_id)
+// bumps last_active_at. Poll and heartbeat don't — those are automated.
+function bumpActive(peerId: string) {
+  const now = new Date().toISOString();
+  updateLastActive.run(now, now, peerId);
+}
+
+// Classify a peer's likely responsiveness based on recent broker-side activity.
+// These are inferences, not guarantees — MCP gives no true delivery receipt.
+function hintFor(row: { last_active_at: string | null; last_poll_at: string | null }): DeliveryHint {
+  const now = Date.now();
+  const pollAt = row.last_poll_at ? new Date(row.last_poll_at).getTime() : 0;
+  const activeAt = row.last_active_at ? new Date(row.last_active_at).getTime() : 0;
+
+  // If the peer isn't polling, channel push won't land — they need peer_check.
+  // Poll loop runs every 1s, so anything older than ~5s means it's not running.
+  if (now - pollAt > 5_000) return "no_channel";
+
+  if (now - activeAt < 15_000) return "responsive";
+  if (now - activeAt < 120_000) return "active";
+  return "idle";
+}
+
 // --- Request handlers ---
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
@@ -209,7 +265,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  const summaryUpdatedAt = body.summary ? now : null;
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, summaryUpdatedAt, now, now);
   return { id };
 }
 
@@ -218,7 +275,9 @@ function handleHeartbeat(body: HeartbeatRequest): void {
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
-  updateSummary.run(body.summary, body.id);
+  const now = new Date().toISOString();
+  updateSummary.run(body.summary, now, body.id);
+  bumpActive(body.id);
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -243,9 +302,11 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       peers = selectAllPeers.all() as Peer[];
   }
 
-  // Exclude the requesting peer
+  // Exclude the requesting peer. Presence of exclude_id also signals this is a
+  // model-initiated listing (not a background/sender-side lookup), so count as activity.
   if (body.exclude_id) {
     peers = peers.filter((p) => p.id !== body.exclude_id);
+    bumpActive(body.exclude_id);
   }
 
   // Hide the 'cli' sentinel row — it's only there to satisfy the from_id FK
@@ -265,33 +326,64 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  const target = selectPeerById.get(body.to) as { id: string } | null;
+function deliverOne(fromId: PeerId, toId: PeerId, text: string, inReplyTo: number | null): Delivery {
+  const target = selectPeerById.get(toId) as
+    | { id: string; last_active_at: string | null; last_poll_at: string | null; last_seen: string }
+    | null;
   if (!target) {
-    return { ok: false, error: `Peer ${body.to} not found` };
+    return { peer_id: toId, ok: false, error: `Peer ${toId} not found` };
+  }
+  const res = insertMessage.run(fromId, toId, text, new Date().toISOString(), inReplyTo);
+  return {
+    peer_id: toId,
+    ok: true,
+    message_id: Number(res.lastInsertRowid),
+    hint: hintFor(target),
+  };
+}
+
+function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
+  const targets = Array.isArray(body.to) ? body.to : [body.to];
+  if (targets.length === 0) {
+    return { ok: false, error: "No recipients specified", deliveries: [] };
+  }
+  const inReplyTo = body.in_reply_to ?? null;
+  const deliveries = targets.map((to) => deliverOne(body.from_id, to, body.text, inReplyTo));
+
+  // Sender originating a send is activity (skip for the 'cli' sentinel).
+  if (body.from_id && body.from_id !== "cli") {
+    const senderExists = selectPeerById.get(body.from_id);
+    if (senderExists) bumpActive(body.from_id);
   }
 
-  insertMessage.run(body.from_id, body.to, body.text, new Date().toISOString());
-  return { ok: true };
+  const anyOk = deliveries.some((d) => d.ok);
+  return { ok: anyOk, deliveries };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
-  // Read-only: caller must explicitly ack via /ack-messages
+  // Poll itself doesn't count as model activity — it's a background timer —
+  // but does update last_poll_at (channel liveness signal).
+  const now = new Date().toISOString();
+  updateLastPoll.run(now, now, body.id);
   return { messages };
 }
 
-const ackMessagesTxn = db.transaction((ids: number[], peerId: string) => {
+const ackMessagesTxn = db.transaction((ids: number[], peerId: string, at: string) => {
   let count = 0;
   for (const id of ids) {
-    count += markDeliveredScoped.run(id, peerId).changes;
+    count += markDeliveredScoped.run(at, id, peerId).changes;
   }
   return count;
 });
 
 function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
   if (body.ids.length === 0) return { ok: true, acked: 0 };
-  return { ok: true, acked: ackMessagesTxn(body.ids, body.peer_id) };
+  const at = new Date().toISOString();
+  const acked = ackMessagesTxn(body.ids, body.peer_id, at);
+  // Ack only fires from inside a tool handler, so it's a solid model-activity signal.
+  bumpActive(body.peer_id);
+  return { ok: true, acked };
 }
 
 function handleUnregister(body: { id: string }): void {
