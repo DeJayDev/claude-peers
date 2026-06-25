@@ -13,6 +13,7 @@ export interface Peer {
   last_seen: string; // ISO timestamp — heartbeat
   last_active_at: string | null; // ISO timestamp — last model-initiated tool call
   last_poll_at: string | null; // ISO timestamp — last /poll-messages (channel liveness)
+  has_channel: boolean; // self-reported: was this instance launched with the channel flag (can receive pushes)
 }
 
 export interface Message {
@@ -34,6 +35,7 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  has_channel: boolean;
 }
 
 export interface RegisterResponse {
@@ -71,6 +73,7 @@ export interface Delivery {
   error?: string;
   message_id?: number;
   hint?: DeliveryHint;
+  target_has_channel?: boolean; // false = poll-only peer; sender should tell it to run peer_check
 }
 
 export interface SendMessageRequest {

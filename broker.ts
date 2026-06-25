@@ -54,7 +54,9 @@ db.run(`
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     last_active_at TEXT,
-    last_poll_at TEXT
+    last_poll_at TEXT,
+    has_channel INTEGER NOT NULL DEFAULT 0,
+    checked_in INTEGER NOT NULL DEFAULT 0
   )
 `);
 
@@ -69,6 +71,8 @@ function addColumnIfMissing(table: string, column: string, definition: string) {
 addColumnIfMissing("peers", "summary_updated_at", "TEXT");
 addColumnIfMissing("peers", "last_active_at", "TEXT");
 addColumnIfMissing("peers", "last_poll_at", "TEXT");
+addColumnIfMissing("peers", "has_channel", "INTEGER NOT NULL DEFAULT 0");
+addColumnIfMissing("peers", "checked_in", "INTEGER NOT NULL DEFAULT 0");
 
 // Migrate pre-CASCADE messages table by dropping it; undelivered messages are ephemeral.
 const existingMessagesSchema = db.query(
@@ -153,8 +157,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, summary_updated_at, registered_at, last_seen, last_active_at, last_poll_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, summary_updated_at, registered_at, last_seen, last_active_at, last_poll_at, has_channel, checked_in)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -170,7 +174,7 @@ const updateLastPoll = db.prepare(`
 `);
 
 const updateSummary = db.prepare(`
-  UPDATE peers SET summary = ?, summary_updated_at = ? WHERE id = ?
+  UPDATE peers SET summary = ?, summary_updated_at = ?, checked_in = 1 WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -196,11 +200,11 @@ const insertMessage = db.prepare(`
 
 const selectUndelivered = db.prepare(`
   SELECT id, from_id, to_id AS "to", text, sent_at, delivered, acked_at, in_reply_to
-  FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+  FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY id ASC
 `);
 
 const selectPeerById = db.prepare(`
-  SELECT id, last_active_at, last_poll_at, last_seen FROM peers WHERE id = ?
+  SELECT id, last_active_at, last_poll_at, last_seen, has_channel FROM peers WHERE id = ?
 `);
 
 const markDeliveredScoped = db.prepare(`
@@ -266,7 +270,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   }
 
   const summaryUpdatedAt = body.summary ? now : null;
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, summaryUpdatedAt, now, now);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, summaryUpdatedAt, now, now, body.has_channel ? 1 : 0);
   return { id };
 }
 
@@ -314,21 +318,25 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   peers = peers.filter((p) => p.id !== "cli");
 
   const now = Date.now();
-  return peers.filter((p) => {
-    const lastSeen = new Date(p.last_seen).getTime();
-    const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
+  return peers
+    .filter((p) => {
+      const lastSeen = new Date(p.last_seen).getTime();
+      const isHeartbeatStale = now - lastSeen > STALE_TIMEOUT_MS;
 
-    if (!isProcessAlive(p.pid) && isHeartbeatStale) {
-      deletePeer.run(p.id);
-      return false;
-    }
-    return true;
-  });
+      if (!isProcessAlive(p.pid) && isHeartbeatStale) {
+        deletePeer.run(p.id);
+        return false;
+      }
+      return true;
+    })
+    // Only surface peers that have announced themselves via peer_checkin.
+    // (has_channel stays 0/1 over the wire; callers read it as truthy.)
+    .filter((p) => Boolean((p as unknown as { checked_in: number }).checked_in));
 }
 
 function deliverOne(fromId: PeerId, toId: PeerId, text: string, inReplyTo: number | null): Delivery {
   const target = selectPeerById.get(toId) as
-    | { id: string; last_active_at: string | null; last_poll_at: string | null; last_seen: string }
+    | { id: string; last_active_at: string | null; last_poll_at: string | null; last_seen: string; has_channel: number }
     | null;
   if (!target) {
     return { peer_id: toId, ok: false, error: `Peer ${toId} not found` };
@@ -339,6 +347,7 @@ function deliverOne(fromId: PeerId, toId: PeerId, text: string, inReplyTo: numbe
     ok: true,
     message_id: Number(res.lastInsertRowid),
     hint: hintFor(target),
+    target_has_channel: Boolean(target.has_channel),
   };
 }
 
