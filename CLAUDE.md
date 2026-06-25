@@ -10,8 +10,8 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Tracks per-peer `has_channel` (self-reported) and `checked_in`; `list-peers` only returns checked-in peers.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications. Tools are gated: only `peer_checkin`/`peer_whoami` until check-in, then the rest (revealed via `tools/list_changed`). Self-detects channel capability from the parent claude's launch flags (`detectChannelOpen`, parent argv) and reports `has_channel` — there is no MCP-protocol signal for it.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
@@ -22,7 +22,8 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 # Start Claude Code with the channel:
 claude --dangerously-load-development-channels server:claude-peers
 
-# Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
+# Or just add to .mcp.json and use as regular MCP (no channel = no push; still must
+# peer_checkin, gets peer_send/peer_check but not peer_list, receives via peer_check):
 # { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
 
 # CLI:

@@ -77,12 +77,19 @@ The other Claude receives it immediately and responds.
 
 ## What Claude can do
 
-| Tool             | What it does                                                                   |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
-| `set_summary`    | Describe what you're working on (visible to other peers)                       |
-| `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+| Tool           | What it does                                                                                     |
+| -------------- | ----------------------------------------------------------------------------------------------- |
+| `peer_checkin` | Announce yourself with a summary. **Call this first** — the other tools stay hidden until you do |
+| `peer_list`    | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` (channel-only)    |
+| `peer_send`    | Send a message to another instance by ID, a list of IDs, or a scope selector to broadcast        |
+| `peer_check`   | Pull pending messages — and the only way to receive if you have no channel                       |
+| `peer_whoami`  | Your own peer ID, CWD, git root, and channel status                                              |
+
+### Check-in and channels
+
+Messaging tools are gated. On startup an instance only has `peer_checkin` and `peer_whoami`; calling `peer_checkin` announces it and reveals the rest. Until then it's invisible to other peers and can't message them.
+
+An instance only receives **pushed** messages if it was launched as a channel (`--dangerously-load-development-channels server:claude-peers`). It self-detects this from its parent process's launch flags — there is no MCP-protocol signal for it. An instance loaded as a plain MCP server (no channel) can still `peer_send` and `peer_check`, but won't get live pushes and won't show in `peer_list`; sending to such a peer reports it as "poll-only" so the sender knows to tell it to run `peer_check`.
 
 ## How it works
 
@@ -104,9 +111,9 @@ The broker auto-launches when the first session starts. It cleans up dead peers 
 
 ## Auto-summary
 
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
+If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `peer_list`.
 
-Without the API key, Claude sets its own summary via the `set_summary` tool.
+The auto-summary only prefills the text — it does **not** check the instance in. An instance still has to call `peer_checkin` to join the network and reveal the messaging tools. Without the API key, the summary you pass to `peer_checkin` is the only one.
 
 ## CLI
 
