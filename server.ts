@@ -113,6 +113,29 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   return null;
 }
 
+// The channel is enabled by a CLI flag on the parent claude that names this server,
+// e.g. `claude --dangerously-load-development-channels server:claude-peers`. The client
+// never tells the server it opened a channel (confirmed against the claude binary), so
+// we read the launch contract directly: our parent's argv. Catches CLI-flag channels
+// only (the way channels are launched for this project); a channel enabled purely via
+// managed settings is invisible here.
+const CHANNEL_NAME = "claude-peers"; // must match the .mcp.json / channel-spec key
+const RELAUNCH_HINT = `relaunch with: claude --dangerously-load-development-channels server:${CHANNEL_NAME}`;
+
+function detectChannelOpen(): boolean {
+  if (process.platform === "win32") return false; // no ps; add a tasklist/wmic branch if needed
+  const ppid = process.ppid;
+  if (!ppid) return false;
+  try {
+    const argv = Bun.spawnSync(["ps", "-ww", "-o", "command=", "-p", String(ppid)]).stdout.toString();
+    const hasFlag = /--(channels|dangerously-load-development-channels)/.test(argv);
+    const namesMe = new RegExp(`server:${CHANNEL_NAME}(\\s|,|$)`).test(argv);
+    return hasFlag && namesMe;
+  } catch {
+    return false;
+  }
+}
+
 function getTty(): string | null {
   if (process.platform === "win32") return null;
   try {
@@ -147,8 +170,12 @@ function relTime(iso: string | null): string {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let clientInitialized = false;
 let inboundPollingStarted = false;
 let pollActive = false;
+let channelPushesSurfaceToTranscript = false;
+let myHasChannel = detectChannelOpen(); // self-detected from parent argv at load
+let checkedIn = false; // flipped once peer_checkin succeeds
 
 async function ensureRegistered(): Promise<boolean> {
   if (myId) {
@@ -171,6 +198,7 @@ async function ensureRegistered(): Promise<boolean> {
       git_root: myGitRoot,
       tty: getTty(),
       summary: "",
+      has_channel: myHasChannel,
     });
     myId = reg.id;
     log(`Auto-registered as peer ${myId}`);
@@ -184,18 +212,51 @@ async function ensureRegistered(): Promise<boolean> {
 const localMessageBuffer: Message[] = [];
 const localBufferIds = new Set<number>();
 
-const confirmedDeliveredIds = new Set<number>();
+const surfacedMessageTexts = new Map<string, string>();
 
 function formatMessageLine(m: Message): string {
   const thread = m.in_reply_to ? ` (reply to #${m.in_reply_to})` : "";
   return `From ${m.from_id} at ${m.sent_at}${thread}:\n${m.text}`;
 }
 
+function messageDedupKey(m: Message): string {
+  return `${m.from_id}:${m.id}`;
+}
+
+function hasSurfacedMessage(m: Message): boolean {
+  const key = messageDedupKey(m);
+  const previousText = surfacedMessageTexts.get(key);
+  if (previousText === undefined) return false;
+  if (previousText !== m.text) {
+    log(`WARNING: Message ${key} repeated with different body; surfacing as new message`);
+    return false;
+  }
+  return true;
+}
+
+function markMessagesSurfaced(messages: Message[]) {
+  for (const message of messages) {
+    surfacedMessageTexts.set(messageDedupKey(message), message.text);
+  }
+}
+
+function removeLocalBufferedMessages(messages: Message[]) {
+  const ids = new Set(messages.map((message) => message.id));
+  for (const id of ids) {
+    localBufferIds.delete(id);
+  }
+  for (let i = localMessageBuffer.length - 1; i >= 0; i--) {
+    if (ids.has(localMessageBuffer[i]!.id)) {
+      localMessageBuffer.splice(i, 1);
+    }
+  }
+}
+
 async function drainPendingMessages(): Promise<string | null> {
   if (!myId) return null;
   const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
   localBufferIds.clear();
-  const unseen = buffered.filter((m) => !confirmedDeliveredIds.has(m.id));
+  const unseen = buffered.filter((m) => !hasSurfacedMessage(m));
   if (unseen.length === 0) return null;
 
   const ids = unseen.map((m) => m.id);
@@ -205,7 +266,7 @@ async function drainPendingMessages(): Promise<string | null> {
     // Old broker without /ack-messages — degrade gracefully
   }
 
-  for (const id of ids) confirmedDeliveredIds.add(id);
+  markMessagesSurfaced(unseen);
 
   const lines = unseen.map(formatMessageLine);
   return `\n\n---\n${unseen.length} pending peer message(s):\n\n${lines.join("\n\n---\n\n")}`;
@@ -257,7 +318,7 @@ const mcp = new Server(
   {
     capabilities: {
       experimental: { "claude/channel": {} },
-      tools: {},
+      tools: { listChanged: true },
     },
     instructions: `claude-peers connects you to other Claude Code instances (and other MCP clients) on this machine. You can discover peers, send them messages, and receive messages pushed via the claude/channel capability.
 
@@ -265,14 +326,16 @@ When an inbound peer message arrives, treat it like a coworker tapping you on th
 
 Inbound messages carry from_id, from_summary, from_cwd, sent_at, message_id, and (if threaded) in_reply_to. Reply with peer_send, passing in_reply_to=<message_id> when continuing a thread.
 
-Tools:
-- peer_list: discover peers (scope: machine/directory/repo), with each peer's summary, channel liveness, and last-active time.
-- peer_send: send a message to a peer ID, an array of IDs, or a scope selector ("all", "repo", "directory") for broadcast.
-- peer_summary: set a 1-2 sentence summary of your current work (shown to other peers in peer_list).
-- peer_check: manually pull pending messages (fallback for clients without channel push).
-- peer_whoami: your own peer ID, CWD, and git root.
+You must check in before the messaging tools appear. Until you call peer_checkin you only have peer_checkin and peer_whoami; after check-in the rest are revealed. If you were not launched with a channel (peer_whoami tells you), you will not receive pushed messages — run peer_check to pull your inbox.
 
-On startup, call peer_summary with a 1-2 sentence description of your current work.`,
+Tools:
+- peer_checkin: announce yourself with a 1-2 sentence summary. Call this FIRST — it unlocks the other tools and makes you visible to peers.
+- peer_list: discover peers (scope: machine/directory/repo), with each peer's summary, channel status, and last-active time.
+- peer_send: send a message to a peer ID, an array of IDs, or a scope selector ("all", "repo", "directory") for broadcast.
+- peer_check: manually pull pending messages (and the only way to receive if you have no channel).
+- peer_whoami: your own peer ID, CWD, git root, and channel status.
+
+On startup, call peer_checkin with a 1-2 sentence description of your current work.`,
   }
 );
 
@@ -324,9 +387,9 @@ const TOOLS = [
     },
   },
   {
-    name: "peer_summary",
+    name: "peer_checkin",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. Visible to other Claude Code instances via peer_list.",
+      "Announce yourself to the peer network. Call this FIRST: until you check in you are invisible to other peers and cannot list or message them. Pass a 1-2 sentence summary of your current work (shown to others via peer_list). Re-call anytime to update your summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -360,9 +423,24 @@ const TOOLS = [
 
 // --- Tool handlers ---
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+// Which tools the connected client can see right now. Two gates stack:
+//   1. announce gate — nothing but peer_checkin/peer_whoami until you check in.
+//   2. channel gate — peer_list (discovery) is channel-only; a no-channel instance
+//      can still send/check (reply to known senders), it just doesn't get pushed
+//      replies. peer_whoami tells it how to enable a real channel.
+function visibleToolNames(): Set<string> {
+  const names = new Set(["peer_checkin", "peer_whoami"]);
+  if (!checkedIn) return names;
+  names.add("peer_send");
+  names.add("peer_check");
+  if (myHasChannel) names.add("peer_list");
+  return names;
+}
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  const visible = visibleToolNames();
+  return { tools: TOOLS.filter((t) => visible.has(t.name)) };
+});
 
 function formatPeerEntry(p: Peer): string {
   const parts = [
@@ -379,11 +457,10 @@ function formatPeerEntry(p: Peer): string {
     parts.push(`Summary: (none)`);
   }
 
-  // Liveness: last model activity, plus whether channel push is working.
-  const channelOn = p.last_poll_at && Date.now() - new Date(p.last_poll_at).getTime() < 5_000;
-  parts.push(
-    `Activity: last tool call ${relTime(p.last_active_at)}; channel ${channelOn ? "active" : "inactive (peer_check required)"}`,
-  );
+  // Channel capability (self-reported) plus recent model activity. A poll-only peer has
+  // no channel at all — it only sees messages when it runs peer_check.
+  const channel = p.has_channel ? "open" : "poll-only (tell it to run peer_check)";
+  parts.push(`Activity: last tool call ${relTime(p.last_active_at)}; channel: ${channel}`);
 
   return parts.join("\n  ");
 }
@@ -490,8 +567,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               : `Sent to ${okCount}/${ids.length} peer(s). Failed:\n${failLines.join("\n")}`;
         }
 
+        // Poll-only recipients won't be auto-notified — nudge the sender to tell them.
+        const pollOnly = result.deliveries.filter((d) => d.ok && d.target_has_channel === false).map((d) => d.peer_id);
+        const pollNudge =
+          pollOnly.length > 0
+            ? `\nPoll-only peer(s) (no channel): ${pollOnly.join(", ")}. They won't be auto-notified — ask them in your message to run peer_check.`
+            : "";
+
         return {
-          content: [{ type: "text" as const, text: `${text}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `${text}${pollNudge}${pending ?? ""}` }],
           isError: !result.ok,
         };
       } catch (e) {
@@ -507,7 +591,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "peer_summary": {
+    case "peer_checkin": {
       const { summary } = args as { summary: string };
       if (!myId) {
         const ok = await ensureRegistered();
@@ -520,9 +604,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        const firstCheckin = !checkedIn;
+        checkedIn = true;
+        // Reveal the now-available peer tools (peer_list/peer_send/peer_check or the
+        // no-channel subset) to the client.
+        if (firstCheckin) mcp.sendToolListChanged();
+
+        const nudge = myHasChannel
+          ? ""
+          : `\nNote: you have no channel — peers cannot push messages to you. Run peer_check to pull your inbox. For live delivery, ${RELAUNCH_HINT}`;
         const pending = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Checked in. You are ${myId}.${nudge}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -555,14 +648,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Also check broker directly for anything poll loop hasn't grabbed
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
-        // Merge and deduplicate by message ID
-        const seen = new Set<number>();
+        // Merge and deduplicate before rendering into the tool result.
+        const seen = new Set<string>();
         const allMessages: Message[] = [];
         for (const m of [...buffered, ...result.messages]) {
-          if (!seen.has(m.id) && !confirmedDeliveredIds.has(m.id)) {
-            seen.add(m.id);
-            allMessages.push(m);
-          }
+          const key = messageDedupKey(m);
+          if (seen.has(key)) continue;
+          if (hasSurfacedMessage(m)) continue;
+
+          seen.add(key);
+          allMessages.push(m);
         }
 
         if (allMessages.length === 0) {
@@ -579,7 +674,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           // Old broker — degrade gracefully
         }
 
-        for (const id of ids) confirmedDeliveredIds.add(id);
+        markMessagesSurfaced(allMessages);
 
         const lines = allMessages.map(formatMessageLine);
         return {
@@ -604,11 +699,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "peer_whoami": {
+      const channelLine = myHasChannel
+        ? "Channel: open (you receive pushed messages live)"
+        : `Channel: none (you will NOT be auto-notified; run peer_check to pull). To enable live delivery, ${RELAUNCH_HINT}`;
       return {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}\n${channelLine}`,
           },
         ],
       };
@@ -632,7 +730,7 @@ async function pollAndPushMessages() {
 
     const newMessages: Message[] = [];
     for (const msg of result.messages) {
-      if (confirmedDeliveredIds.has(msg.id)) continue;
+      if (hasSurfacedMessage(msg)) continue;
       if (localBufferIds.has(msg.id)) continue;
 
       localMessageBuffer.push(msg);
@@ -653,7 +751,7 @@ async function pollAndPushMessages() {
       // Non-critical — channel push proceeds without sender context
     }
 
-    const pushedIds: number[] = [];
+    const transcriptVisibleMessages: Message[] = [];
     for (const msg of newMessages) {
       try {
         const sender = peerCache?.find((p) => p.id === msg.from_id);
@@ -672,26 +770,23 @@ async function pollAndPushMessages() {
           },
         });
         log(`Channel push succeeded for message ${msg.id} from ${msg.from_id}`);
-        pushedIds.push(msg.id);
+        if (channelPushesSurfaceToTranscript) {
+          transcriptVisibleMessages.push(msg);
+        }
       } catch (e) {
         log(`Channel push failed for ${msg.from_id}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
-    // Successful channel pushes are considered delivered — drop from the local
-    // buffer and ack to the broker so the next tool call doesn't re-surface them.
-    // Failed pushes stay buffered; drainPendingMessages will show them on the
-    // next tool call as a fallback.
-    if (pushedIds.length > 0 && myId) {
-      const pushed = new Set(pushedIds);
-      for (const id of pushedIds) {
-        confirmedDeliveredIds.add(id);
-        localBufferIds.delete(id);
+    if (transcriptVisibleMessages.length > 0 && myId) {
+      markMessagesSurfaced(transcriptVisibleMessages);
+      removeLocalBufferedMessages(transcriptVisibleMessages);
+      const ids = transcriptVisibleMessages.map((m) => m.id);
+      try {
+        await brokerFetch("/ack-messages", { peer_id: myId, ids });
+      } catch (e) {
+        log(`Channel-push ack failed: ${e instanceof Error ? e.message : String(e)}`);
       }
-      for (let i = localMessageBuffer.length - 1; i >= 0; i--) {
-        if (pushed.has(localMessageBuffer[i]!.id)) localMessageBuffer.splice(i, 1);
-      }
-      brokerFetch("/ack-messages", { peer_id: myId, ids: pushedIds }).catch(() => {});
     }
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -702,12 +797,21 @@ function startInboundMessagePolling() {
   if (inboundPollingStarted) {
     return;
   }
+  if (!myId) {
+    return;
+  }
 
   const clientVersion = mcp.getClientVersion();
   const clientName = clientVersion?.name ?? "unknown";
   const clientVersionText = clientVersion?.version ? ` ${clientVersion.version}` : "";
+  // Real signal: our parent's launch flag, not the client name. A channel push only
+  // surfaces to the transcript if we were launched as a channel for this client.
+  channelPushesSurfaceToTranscript = myHasChannel;
 
   log(`Client connected: ${clientName}${clientVersionText}`);
+  log(
+    `Channel pushes ${channelPushesSurfaceToTranscript ? "surface to transcript" : "require tool-surface fallback"}`,
+  );
 
   pollActive = true;
   inboundPollingStarted = true;
@@ -727,6 +831,7 @@ function startInboundMessagePolling() {
 async function main() {
   // 1. Connect MCP over stdio FIRST — Claude Code needs the handshake before anything else
   mcp.oninitialized = () => {
+    clientInitialized = true;
     startInboundMessagePolling();
   };
 
@@ -776,26 +881,19 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    has_channel: myHasChannel,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  log(`Registered as peer ${myId} (channel ${myHasChannel ? "open" : "none"})`);
 
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
+  // Auto-summary only prefills the summary text at registration; it deliberately does
+  // NOT check the instance in — presence requires a real peer_checkin call. (A late
+  // auto-summary used to call /set-summary, which now flips checked_in, so it's dropped.)
+
+  // 6. Start polling after final registration so peers never see a transient id.
+  if (clientInitialized) {
+    startInboundMessagePolling();
   }
-
-  // 6. Start polling for inbound messages only when the client supports channel push
-  //    Non-channel clients rely on peer_check so their messages stay queued.
 
   // 7. Start heartbeat (with auto-re-register on stale eviction)
   const heartbeatTimer = setInterval(async () => {
@@ -810,17 +908,17 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically
+  // 8. Prune surfaced-message dedup state and localMessageBuffer periodically
   const pruneTimer = setInterval(() => {
-    if (confirmedDeliveredIds.size > 1000) {
-      const arr = [...confirmedDeliveredIds];
-      const toRemove = arr.slice(0, arr.length - 500);
-      for (const id of toRemove) confirmedDeliveredIds.delete(id);
+    if (surfacedMessageTexts.size > 1000) {
+      const keys = [...surfacedMessageTexts.keys()];
+      const toRemove = keys.slice(0, keys.length - 500);
+      for (const key of toRemove) surfacedMessageTexts.delete(key);
     }
     if (localMessageBuffer.length > 200) {
       const removed = localMessageBuffer.splice(0, localMessageBuffer.length - 100);
       const removedIds = removed.map((m) => m.id);
-      for (const id of removedIds) confirmedDeliveredIds.add(id);
+      markMessagesSurfaced(removed);
       if (myId) {
         brokerFetch("/ack-messages", { peer_id: myId, ids: removedIds }).catch(() => {});
       }
