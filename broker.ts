@@ -284,26 +284,29 @@ function handleSetSummary(body: SetSummaryRequest): void {
   bumpActive(body.id);
 }
 
+// DB row: Peer plus the broker-internal checked_in flag (not exposed in the API type).
+type PeerRow = Peer & { checked_in: number };
+
 function handleListPeers(body: ListPeersRequest): Peer[] {
-  let peers: Peer[];
+  let peers: PeerRow[];
 
   switch (body.scope) {
     case "machine":
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllPeers.all() as PeerRow[];
       break;
     case "directory":
-      peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+      peers = selectPeersByDirectory.all(body.cwd) as PeerRow[];
       break;
     case "repo":
       if (body.git_root) {
-        peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
+        peers = selectPeersByGitRoot.all(body.git_root) as PeerRow[];
       } else {
         // No git root, fall back to directory
-        peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+        peers = selectPeersByDirectory.all(body.cwd) as PeerRow[];
       }
       break;
     default:
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllPeers.all() as PeerRow[];
   }
 
   // Exclude the requesting peer. Presence of exclude_id also signals this is a
@@ -331,7 +334,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     })
     // Only surface peers that have announced themselves via peer_checkin.
     // (has_channel stays 0/1 over the wire; callers read it as truthy.)
-    .filter((p) => Boolean((p as unknown as { checked_in: number }).checked_in));
+    .filter((p) => Boolean(p.checked_in));
 }
 
 function deliverOne(fromId: PeerId, toId: PeerId, text: string, inReplyTo: number | null): Delivery {

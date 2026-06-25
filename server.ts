@@ -173,7 +173,6 @@ let myGitRoot: string | null = null;
 let clientInitialized = false;
 let inboundPollingStarted = false;
 let pollActive = false;
-let channelPushesSurfaceToTranscript = false;
 let myHasChannel = detectChannelOpen(); // self-detected from parent argv at load
 let checkedIn = false; // flipped once peer_checkin succeeds
 
@@ -770,7 +769,7 @@ async function pollAndPushMessages() {
           },
         });
         log(`Channel push succeeded for message ${msg.id} from ${msg.from_id}`);
-        if (channelPushesSurfaceToTranscript) {
+        if (myHasChannel) {
           transcriptVisibleMessages.push(msg);
         }
       } catch (e) {
@@ -804,14 +803,11 @@ function startInboundMessagePolling() {
   const clientVersion = mcp.getClientVersion();
   const clientName = clientVersion?.name ?? "unknown";
   const clientVersionText = clientVersion?.version ? ` ${clientVersion.version}` : "";
-  // Real signal: our parent's launch flag, not the client name. A channel push only
-  // surfaces to the transcript if we were launched as a channel for this client.
-  channelPushesSurfaceToTranscript = myHasChannel;
 
   log(`Client connected: ${clientName}${clientVersionText}`);
-  log(
-    `Channel pushes ${channelPushesSurfaceToTranscript ? "surface to transcript" : "require tool-surface fallback"}`,
-  );
+  // Real signal: our parent's launch flag, not the client name. A channel push only
+  // surfaces to the transcript if we were launched as a channel for this client.
+  log(`Channel pushes ${myHasChannel ? "surface to transcript" : "require tool-surface fallback"}`);
 
   pollActive = true;
   inboundPollingStarted = true;
