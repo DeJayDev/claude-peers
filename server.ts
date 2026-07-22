@@ -18,6 +18,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
   PeerId,
@@ -33,6 +37,7 @@ import {
   getRecentFiles,
   SUMMARY_MODEL,
 } from "./shared/summarize.ts";
+import { isClaudeCodeClient } from "./shared/client.ts";
 import { homedir } from "node:os";
 
 // --- Configuration ---
@@ -43,6 +48,12 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = Bun.fileURLToPath(new URL("./broker.ts", import.meta.url));
 const BROKER_LOG = `${homedir()}/.claude-peers-broker.log`;
+
+// The peer skill ships in this repo and is served over the wire: as an MCP prompt
+// (Claude Code surfaces it as /mcp__claude-peers__peer <role>) and as a skill:// resource.
+const SKILL_URI = "skill://peer/SKILL.md";
+const SKILL_PATH = Bun.fileURLToPath(new URL("./skills/peer/SKILL.md", import.meta.url));
+const skillBody = await Bun.file(SKILL_PATH).text();
 
 // --- Broker communication ---
 
@@ -105,9 +116,10 @@ function log(msg: string) {
 
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
-    const result = await Bun.$`git -C ${cwd} rev-parse --show-toplevel`.quiet().nothrow();
+    const result = await Bun.$`git -C ${cwd} rev-parse --path-format=absolute --git-common-dir`.quiet().nothrow();
     if (result.exitCode === 0) {
-      return result.text().trim();
+      const commonDir = result.text().trim();
+      return commonDir.endsWith("/.git") ? commonDir.slice(0, -"/.git".length) : commonDir;
     }
   } catch {}
   return null;
@@ -121,6 +133,13 @@ async function getGitRoot(cwd: string): Promise<string | null> {
 // managed settings is invisible here.
 const CHANNEL_NAME = "claude-peers"; // must match the .mcp.json / channel-spec key
 const RELAUNCH_HINT = `relaunch with: claude --dangerously-load-development-channels server:${CHANNEL_NAME}`;
+
+function liveDeliveryHint(): string {
+  // The relaunch command is specific to Claude Code. Other MCP clients may have
+  // entirely different ways to enable notifications, so don't send them on a
+  // wild goose chase with a Claude CLI command.
+  return isClaudeCodeClient(mcp.getClientVersion()) ? ` For live delivery, ${RELAUNCH_HINT}` : "";
+}
 
 function detectChannelOpen(): boolean {
   if (process.platform === "win32") return false; // no ps; add a tasklist/wmic branch if needed
@@ -175,6 +194,31 @@ let inboundPollingStarted = false;
 let pollActive = false;
 let myHasChannel = detectChannelOpen(); // self-detected from parent argv at load
 let checkedIn = false; // flipped once peer_checkin succeeds
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+let pruneTimer: ReturnType<typeof setInterval> | undefined;
+
+// Claude Code closes the stdio pipe on exit without signalling us, so without this the
+// process is reparented to init and heartbeats to the broker forever. Defined at module
+// scope so a client that dies mid-startup is cleaned up too.
+async function cleanup() {
+  pollActive = false;
+  clearInterval(heartbeatTimer);
+  clearInterval(pruneTimer);
+  if (myId) {
+    try {
+      await brokerFetch("/unregister", { id: myId });
+      log("Unregistered from broker");
+    } catch {
+      // Best effort
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
+process.stdin.on("close", cleanup);
+process.stdin.on("end", cleanup);
 
 async function ensureRegistered(): Promise<boolean> {
   if (myId) {
@@ -313,11 +357,16 @@ async function resolveRecipients(to: unknown): Promise<{ ids: PeerId[]; error?: 
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.2.0" },
+  { name: "claude-peers", version: "0.1.0" },
   {
     capabilities: {
+      // Not an MCP capability: "claude/channel" and notifications/claude/channel are a
+      // Claude Code development feature, parked in the spec's `experimental` bag. Other
+      // MCP clients ignore both; for them this server is poll-only (peer_check).
       experimental: { "claude/channel": {} },
       tools: { listChanged: true },
+      prompts: {},
+      resources: {},
     },
     instructions: `claude-peers connects you to other Claude Code instances (and other MCP clients) on this machine. You can discover peers, send them messages, and receive messages pushed via the claude/channel capability.
 
@@ -325,14 +374,14 @@ When an inbound peer message arrives, treat it like a coworker tapping you on th
 
 Inbound messages carry from_id, from_summary, from_cwd, sent_at, message_id, and (if threaded) in_reply_to. Reply with peer_send, passing in_reply_to=<message_id> when continuing a thread.
 
-You must check in before the messaging tools appear. Until you call peer_checkin you only have peer_checkin and peer_whoami; after check-in the rest are revealed. If you were not launched with a channel (peer_whoami tells you), you will not receive pushed messages — run peer_check to pull your inbox.
+You must check in before the messaging tools appear. Until you call peer_checkin you only have peer_checkin and peer_whoami; after check-in the rest are revealed. If you were not launched with a channel (peer_checkin's reply tells you), you will not receive pushed messages — run peer_check to pull your inbox.
 
 Tools:
 - peer_checkin: announce yourself with a 1-2 sentence summary. Call this FIRST — it unlocks the other tools and makes you visible to peers.
 - peer_list: discover peers (scope: machine/directory/repo), with each peer's summary, channel status, and last-active time.
 - peer_send: send a message to a peer ID, an array of IDs, or a scope selector ("all", "repo", "directory") for broadcast.
 - peer_check: manually pull pending messages (and the only way to receive if you have no channel).
-- peer_whoami: your own peer ID, CWD, git root, and channel status.
+- peer_whoami: your own peer ID, CWD, and git root.
 
 On startup, call peer_checkin with a 1-2 sentence description of your current work.`,
   }
@@ -357,6 +406,7 @@ const TOOLS = [
       },
       required: ["scope"],
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "peer_send",
@@ -384,6 +434,7 @@ const TOOLS = [
       },
       required: ["to", "message"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
   {
     name: "peer_checkin",
@@ -399,6 +450,7 @@ const TOOLS = [
       },
       required: ["summary"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
   {
     name: "peer_check",
@@ -406,8 +458,9 @@ const TOOLS = [
       "Manually check for new messages from other Claude Code instances. Messages normally arrive via channel push, but this is a reliable fallback.",
     inputSchema: {
       type: "object" as const,
-      properties: {},
+      additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "peer_whoami",
@@ -415,10 +468,87 @@ const TOOLS = [
       "Returns this Claude Code instance's own peer ID, working directory, and git root. Useful for telling other peers how to message you.",
     inputSchema: {
       type: "object" as const,
-      properties: {},
+      additionalProperties: false,
     },
+    annotations: { readOnlyHint: true, openWorldHint: false },
   },
 ];
+
+// --- Skill delivery: prompt + resource ---
+
+// Claude Code renders this as `/mcp__claude-peers__peer <role>` and injects the result
+// straight into the conversation. Roles:
+//   captain          -> you run the objective, you delegate
+//   <peer-id>        -> you are a worker reporting to that peer
+//   (omitted)        -> find the captain on the roster and enlist
+function roleDirective(role: string): string {
+  const trimmed = role.trim().toLowerCase();
+
+  if (["captain", "driver", "lead", "boss"].includes(trimmed)) {
+    return `You are the CAPTAIN. Check in with a summary starting with "CAPTAIN", then peer_list to see who is available and issue work orders. You do not wait for anyone.`;
+  }
+  if (trimmed === "") {
+    return `No role given. Check in first, then peer_list {scope: "repo"} and read the roster. If a peer's summary starts with "CAPTAIN", enlist with it per the Enlisting rules and wait for a work order. If nobody is captain, you are the CAPTAIN.`;
+  }
+  // Anything else is taken as the peer id of your captain.
+  return `You are a WORKER reporting to peer ${role.trim()}. Check in with a summary starting with "WORKER reports:${role.trim()}", then message that peer that you are awaiting a work order, then poll peer_check until it lands.`;
+}
+
+mcp.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: [
+    {
+      name: "peer",
+      title: "Join the peer network",
+      description:
+        "Join claude-peers in a role. Pass 'captain' to run the objective, a peer id to report to that peer, or nothing to find the captain and enlist.",
+      arguments: [
+        {
+          name: "role",
+          description: "'captain', a peer id to report to, or omitted to enlist with whoever is captain.",
+          required: false,
+        },
+      ],
+    },
+  ],
+}));
+
+mcp.setRequestHandler(GetPromptRequestSchema, async (req) => {
+  if (req.params.name !== "peer") throw new Error(`Unknown prompt: ${req.params.name}`);
+  const role = req.params.arguments?.role ?? "";
+  return {
+    description: "claude-peers operating rules and your role in this objective.",
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text: `${skillBody}\n\n# Your role right now\n\n${roleDirective(role)}`,
+        },
+      },
+    ],
+  };
+});
+
+// SEP-2640 shape (draft). No client auto-loads skill:// yet, so the prompt above is the
+// path that actually works today; this is here for the ones that will.
+mcp.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: SKILL_URI,
+      name: "peer",
+      description:
+        "How to work with other agents over claude-peers: roles, work orders, authority, liveness.",
+      mimeType: "text/markdown",
+    },
+  ],
+}));
+
+mcp.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+  if (req.params.uri !== SKILL_URI) throw new Error(`Unknown resource: ${req.params.uri}`);
+  return {
+    contents: [{ uri: SKILL_URI, mimeType: "text/markdown", text: skillBody }],
+  };
+});
 
 // --- Tool handlers ---
 
@@ -426,7 +556,7 @@ const TOOLS = [
 //   1. announce gate — nothing but peer_checkin/peer_whoami until you check in.
 //   2. channel gate — peer_list (discovery) is channel-only; a no-channel instance
 //      can still send/check (reply to known senders), it just doesn't get pushed
-//      replies. peer_whoami tells it how to enable a real channel.
+//      replies. peer_checkin's reply tells it how to enable a real channel.
 function visibleToolNames(): Set<string> {
   const names = new Set(["peer_checkin", "peer_whoami"]);
   if (!checkedIn) return names;
@@ -609,12 +739,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // no-channel subset) to the client.
         if (firstCheckin) mcp.sendToolListChanged();
 
-        const nudge = myHasChannel
-          ? ""
-          : `\nNote: you have no channel — peers cannot push messages to you. Run peer_check to pull your inbox. For live delivery, ${RELAUNCH_HINT}`;
+        const channelLine = myHasChannel
+          ? "\nChannel: open — peers' messages are pushed to you live."
+          : `\nChannel: none — peers cannot push messages to you. Run peer_check to pull your inbox.${liveDeliveryHint()}`;
         const pending = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Checked in. You are ${myId}.${nudge}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Checked in. You are ${myId}.${channelLine}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -698,14 +828,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "peer_whoami": {
-      const channelLine = myHasChannel
-        ? "Channel: open (you receive pushed messages live)"
-        : `Channel: none (you will NOT be auto-notified; run peer_check to pull). To enable live delivery, ${RELAUNCH_HINT}`;
       return {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}\n${channelLine}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
           },
         ],
       };
@@ -768,7 +895,8 @@ async function pollAndPushMessages() {
             },
           },
         });
-        log(`Channel push succeeded for message ${msg.id} from ${msg.from_id}`);
+        // A JSON-RPC notification has no reply — this only means it reached the transport.
+        log(`Channel push sent for message ${msg.id} from ${msg.from_id}`);
         if (myHasChannel) {
           transcriptVisibleMessages.push(msg);
         }
@@ -892,7 +1020,7 @@ async function main() {
   }
 
   // 7. Start heartbeat (with auto-re-register on stale eviction)
-  const heartbeatTimer = setInterval(async () => {
+  heartbeatTimer = setInterval(async () => {
     if (!myId) {
       await ensureRegistered();
       return;
@@ -905,7 +1033,7 @@ async function main() {
   }, HEARTBEAT_INTERVAL_MS);
 
   // 8. Prune surfaced-message dedup state and localMessageBuffer periodically
-  const pruneTimer = setInterval(() => {
+  pruneTimer = setInterval(() => {
     if (surfacedMessageTexts.size > 1000) {
       const keys = [...surfacedMessageTexts.keys()];
       const toRemove = keys.slice(0, keys.length - 500);
@@ -924,24 +1052,6 @@ async function main() {
     }
   }, 60_000);
 
-  // 9. Clean up on exit
-  const cleanup = async () => {
-    pollActive = false;
-    clearInterval(heartbeatTimer);
-    clearInterval(pruneTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
-      } catch {
-        // Best effort
-      }
-    }
-    process.exit(0);
-  };
-
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
 }
 
 main().catch((e) => {
