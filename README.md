@@ -34,7 +34,7 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ### 1. Install
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
+git clone https://github.com/dejaydev/claude-peers.git ~/claude-peers-mcp   # or wherever you like
 cd ~/claude-peers-mcp
 bun install
 ```
@@ -44,7 +44,7 @@ bun install
 This makes claude-peers available in every Claude Code session, from any directory:
 
 ```bash
-claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
+claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers/server.ts
 ```
 
 Replace `~/claude-peers-mcp` with wherever you cloned it.
